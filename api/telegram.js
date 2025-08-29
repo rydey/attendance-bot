@@ -32,6 +32,31 @@ async function removeSubscriber(userId) {
   try { await kv.srem(SUBS_KEY, String(userId)); } catch (e) { console.error('kv.srem error', e); }
 }
 
+// use ctx.api (not bot.telegram)
+async function notifyAllUsers(ctx, userIds, previewText, linkUrl) {
+  const inline_keyboard = linkUrl ? [[{ text: 'Open message', url: linkUrl }]] : [];
+  const suffix = linkUrl ? '' : '\n(Direct link not available for this group)';
+
+  for (const uid of userIds) {
+    try {
+      await ctx.api.sendMessage(
+        uid,
+        `🔔 "Attendance" mentioned\n${previewText}${suffix}`,
+        { reply_markup: { inline_keyboard } }
+      );
+      await new Promise(r => setTimeout(r, 50)); // gentle rate limit
+    } catch (e) {
+      const code = e?.response?.error_code;
+      const desc = e?.response?.description || e.message;
+      console.error('send error to', uid, code, desc);
+      // if you maintain a subscriber list, remove on 403 (blocked)
+      if (String(code) === '403') {
+        await removeSubscriber(uid);
+      }
+    }
+  }
+}
+
 function initBot() {
   if (bot) return bot;
   if (!process.env.BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
@@ -66,30 +91,14 @@ function initBot() {
     const text = extractText(ctx.message);
     if (!text || !KEYWORD.test(text)) return;
 
-    const link = buildLink(ctx.chat, ctx.message.message_id);
     const groupName = ctx.chat.title || 'a group';
+    const link = buildLink(ctx.chat, ctx.message.message_id);
     const excerpt = text.replace(/\s+/g,' ').slice(0,160);
+    const preview = `In ${groupName}: "${excerpt}"`;
 
+    // get your subscriber IDs from KV / DB
     const subs = await listSubscribers();
-    // Fan-out politely. For this scale, a simple loop is fine.
-    const payload = `🔔 “Attendance” mentioned\nIn ${groupName}: “${excerpt}”` + (link ? '' : '\n(Direct link not available for this group)');
-    const markup = link ? { reply_markup: { inline_keyboard: [[{ text: 'Open message', url: link }]] } } : undefined;
-
-    for (const uid of subs) {
-      try {
-        await ctx.api.sendMessage(uid, payload, markup);
-        // small delay to be gentle with limits
-        await new Promise(r => setTimeout(r, 50));
-      } catch (e) {
-        const code = e?.response?.error_code;
-        if (String(code) === '403') {
-          // user blocked the bot; remove from set
-          await removeSubscriber(uid);
-        } else {
-          console.error('DM error to', uid, e?.response?.description || e?.message || e);
-        }
-      }
-    }
+    await notifyAllUsers(ctx, subs, preview, link);
   });
 
   // No bot.launch() in webhook mode
