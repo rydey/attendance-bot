@@ -32,14 +32,14 @@ async function removeSubscriber(userId) {
   try { await kv.srem(SUBS_KEY, String(userId)); } catch (e) { console.error('kv.srem error', e); }
 }
 
-// use ctx.api (not bot.telegram)
-async function notifyAllUsers(ctx, userIds, previewText, linkUrl) {
+// use bot.telegram for webhook mode
+async function notifyAllUsers(bot, userIds, previewText, linkUrl) {
   const inline_keyboard = linkUrl ? [[{ text: 'Open message', url: linkUrl }]] : [];
   const suffix = linkUrl ? '' : '\n(Direct link not available for this group)';
 
   for (const uid of userIds) {
     try {
-      await ctx.api.sendMessage(
+      await bot.telegram.sendMessage(
         uid,
         `🔔 "Attendance" mentioned\n${previewText}${suffix}`,
         { reply_markup: { inline_keyboard } }
@@ -98,7 +98,7 @@ function initBot() {
 
     // get your subscriber IDs from KV / DB
     const subs = await listSubscribers();
-    await notifyAllUsers(ctx, subs, preview, link);
+    await notifyAllUsers(bot, subs, preview, link);
   });
 
   // No bot.launch() in webhook mode
