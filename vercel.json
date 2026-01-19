@@ -1,0 +1,9 @@
+{
+  "crons": [
+    {
+      "path": "/api/class-reminders",
+      "schedule": "25 13 * * 1-4"
+    }
+  ]
+}
+

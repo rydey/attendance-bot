@@ -3,7 +3,20 @@ import { Telegraf, Markup } from 'telegraf';
 import { kv } from '@vercel/kv';
 
 const KEYWORD = /(^|\W)attendance(\W|$)/i;
-const SUBS_KEY = 'subs:attendance'; // a Redis set of user_ids
+const SUBS_ATTENDANCE_KEY = 'subs:attendance'; // a Redis set of user_ids
+const SUBS_CLASS_KEY = 'subs:class'; // a Redis set of user_ids
+
+// Class reminder schedule (GMT+5)
+// Assumption: "GMT +5, 18:25" is the reminder time (5 mins before 18:30 class).
+const CLASS_REMINDER_HOUR_GMT5 = 18;
+const CLASS_REMINDER_MINUTE_GMT5 = 25;
+const CLASS_SCHEDULE_BY_GMT5_DAY = {
+  // 1=Mon .. 4=Thu (based on getUTCDay after +5h offset)
+  1: 'Database Design Concepts',
+  2: 'Computer Systems',
+  3: 'Business Skills for E- Commerce',
+  4: 'Website Design',
+};
 
 function extractText(msg) {
   return (msg?.text || msg?.caption || '').trim();
@@ -22,14 +35,101 @@ function getBody(req) {
 let bot;
 let botUsername;
 
-async function addSubscriber(userId) {
-  try { await kv.sadd(SUBS_KEY, String(userId)); } catch (e) { console.error('kv.sadd error', e); }
+async function setSub(key, userId, enabled) {
+  try {
+    if (enabled) await kv.sadd(key, String(userId));
+    else await kv.srem(key, String(userId));
+  } catch (e) {
+    console.error('kv subscription error', key, e);
+  }
 }
-async function listSubscribers() {
-  try { return (await kv.smembers(SUBS_KEY)).map(id => Number(id)); } catch (e) { console.error('kv.smembers error', e); return []; }
+async function isSub(key, userId) {
+  try {
+    // Redis SISMEMBER returns 1/0
+    return (await kv.sismember(key, String(userId))) === 1;
+  } catch (e) {
+    console.error('kv.sismember error', key, e);
+    return false;
+  }
 }
-async function removeSubscriber(userId) {
-  try { await kv.srem(SUBS_KEY, String(userId)); } catch (e) { console.error('kv.srem error', e); }
+async function listSubs(key) {
+  try {
+    return (await kv.smembers(key)).map(id => Number(id));
+  } catch (e) {
+    console.error('kv.smembers error', key, e);
+    return [];
+  }
+}
+async function removeFromAllLists(userId) {
+  await Promise.all([
+    setSub(SUBS_ATTENDANCE_KEY, userId, false),
+    setSub(SUBS_CLASS_KEY, userId, false),
+  ]);
+}
+
+async function getSettings(userId) {
+  const [attendance, classReminders] = await Promise.all([
+    isSub(SUBS_ATTENDANCE_KEY, userId),
+    isSub(SUBS_CLASS_KEY, userId),
+  ]);
+  return { attendance, classReminders };
+}
+
+function formatSettingsText(settings) {
+  const att = settings.attendance ? 'ON' : 'OFF';
+  const cls = settings.classReminders ? 'ON' : 'OFF';
+  const lines = [
+    'Choose your reminders:',
+    '',
+    'Attendance reminders = I DM you when someone says “Attendance” in a group I’m in.',
+    '',
+    `Attendance reminders: ${att}`,
+    `Class reminders: ${cls}`,
+    '',
+    `Class reminders schedule (GMT+5, ${String(CLASS_REMINDER_HOUR_GMT5).padStart(2, '0')}:${String(CLASS_REMINDER_MINUTE_GMT5).padStart(2, '0')}):`,
+    `Every Monday — ${CLASS_SCHEDULE_BY_GMT5_DAY[1]}`,
+    `Tuesday — ${CLASS_SCHEDULE_BY_GMT5_DAY[2]}`,
+    `Wed — ${CLASS_SCHEDULE_BY_GMT5_DAY[3]}`,
+    `Thurs — ${CLASS_SCHEDULE_BY_GMT5_DAY[4]}`,
+    '',
+    'Tip: Class reminders say “{class} class starts in 5 mins”.',
+  ];
+  return lines.join('\n');
+}
+
+function buildMenuKeyboard(settings) {
+  const attendanceOnlySelected = settings.attendance && !settings.classReminders;
+  const bothSelected = settings.attendance && settings.classReminders;
+  const disabledSelected = !settings.attendance && !settings.classReminders;
+
+  const addToGroupUrl = botUsername
+    ? `https://t.me/${botUsername}?startgroup=true`
+    : 'https://t.me';
+
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`${attendanceOnlySelected ? '✅ ' : ''}Attendance reminders`, 'preset:attendance')],
+    [Markup.button.callback(`${bothSelected ? '✅ ' : ''}Attendance + Class reminders`, 'preset:both')],
+    [Markup.button.callback(`${disabledSelected ? '✅ ' : ''}Disable reminders`, 'preset:none')],
+    [Markup.button.url('➕ Add me to a group', addToGroupUrl)],
+  ]);
+}
+
+async function showMenu(ctx, { preferEdit = false } = {}) {
+  if (ctx.chat?.type !== 'private') return;
+  const settings = await getSettings(ctx.from.id);
+  const text = formatSettingsText(settings);
+  const keyboard = buildMenuKeyboard(settings);
+
+  if (preferEdit && ctx.updateType === 'callback_query') {
+    try {
+      await ctx.editMessageText(text, keyboard);
+      return;
+    } catch {
+      // fall through to reply if edit fails (e.g. message too old / not modified)
+    }
+  }
+
+  await ctx.reply(text, keyboard);
 }
 
 // use bot.telegram for webhook mode
@@ -51,7 +151,7 @@ async function notifyAllUsers(bot, userIds, previewText, linkUrl) {
       console.error('send error to', uid, code, desc);
       // if you maintain a subscriber list, remove on 403 (blocked)
       if (String(code) === '403') {
-        await removeSubscriber(uid);
+        await removeFromAllLists(uid);
       }
     }
   }
@@ -64,27 +164,53 @@ function initBot() {
   bot = new Telegraf(process.env.BOT_TOKEN);
   bot.telegram.getMe().then(me => { botUsername = me.username; }).catch(()=>{});
 
-  // /start — ONLY reply in private, and store the user id
+  // /start — ONLY reply in private, show menu
   bot.start(async (ctx) => {
-    if (ctx.chat?.type !== 'private') return; // prevent group noise
-    await addSubscriber(ctx.from.id);
-    await ctx.reply(
-      'You’ll get a DM when someone says “Attendance” in groups I’m in.',
-      Markup.inlineKeyboard([
-        [Markup.button.url('➕ Add me to a group',
-          botUsername ? `https://t.me/${botUsername}?startgroup=true` : 'https://t.me')]
-      ])
-    );
+    await showMenu(ctx);
   });
 
-  // Optional: /stop to opt out (private only)
+  // /settings — show menu again (private only)
+  bot.command(['settings', 'menu'], async (ctx) => {
+    await showMenu(ctx);
+  });
+
+  bot.action('preset:attendance', async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    const userId = ctx.from.id;
+    await Promise.all([
+      setSub(SUBS_ATTENDANCE_KEY, userId, true),
+      setSub(SUBS_CLASS_KEY, userId, false),
+    ]);
+    await ctx.answerCbQuery('Attendance reminders enabled.');
+    await showMenu(ctx, { preferEdit: true });
+  });
+
+  bot.action('preset:both', async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    const userId = ctx.from.id;
+    await Promise.all([
+      setSub(SUBS_ATTENDANCE_KEY, userId, true),
+      setSub(SUBS_CLASS_KEY, userId, true),
+    ]);
+    await ctx.answerCbQuery('Attendance + Class reminders enabled.');
+    await showMenu(ctx, { preferEdit: true });
+  });
+
+  bot.action('preset:none', async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    await removeFromAllLists(ctx.from.id);
+    await ctx.answerCbQuery('Reminders disabled.');
+    await showMenu(ctx, { preferEdit: true });
+  });
+
+  // /stop to opt out (private only) — disables all reminders
   bot.command('stop', async (ctx) => {
     if (ctx.chat?.type !== 'private') return;
-    await removeSubscriber(ctx.from.id);
-    await ctx.reply('Okay, I won’t DM you anymore for “Attendance”. You can /start again anytime.');
+    await removeFromAllLists(ctx.from.id);
+    await ctx.reply('Okay — all reminders disabled. You can /start anytime to re-enable.');
   });
 
-  // Group messages → keyword detect → DM all subscribers
+  // Group messages → keyword detect → DM attendance subscribers
   bot.on('message', async (ctx) => {
     if (!['group','supergroup'].includes(ctx.chat?.type)) return;
 
@@ -97,7 +223,7 @@ function initBot() {
     const preview = `In ${groupName}: "${excerpt}"`;
 
     // get your subscriber IDs from KV / DB
-    const subs = await listSubscribers();
+    const subs = await listSubs(SUBS_ATTENDANCE_KEY);
     await notifyAllUsers(bot, subs, preview, link);
   });
 
